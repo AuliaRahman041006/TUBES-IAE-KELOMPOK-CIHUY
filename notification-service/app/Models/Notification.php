@@ -6,21 +6,5 @@ use Illuminate\Database\Eloquent\Model;
 
 class Notification extends Model
 {
-    protected $fillable = [
-        'order_id',
-        'recipient',
-        'type',
-        'title',
-        'message',
-        'data',
-        'read_at',
-    ];
-
-    protected function casts(): array
-    {
-        return [
-            'data' => 'array',
-            'read_at' => 'datetime',
-        ];
-    }
+    protected $fillable = ['user_id', 'message', 'is_read'];
 }

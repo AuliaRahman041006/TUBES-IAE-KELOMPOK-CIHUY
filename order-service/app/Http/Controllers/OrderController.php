@@ -3,297 +3,81 @@
 namespace App\Http\Controllers;
 
 use App\Models\Order;
-use App\Jobs\ReduceProductStockJob;
-use App\Jobs\RestoreProductStockJob;
-use App\Jobs\SendOrderNotificationJob;
+use App\Models\OrderItem;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Redis;
 use Illuminate\Support\Facades\Http;
 
 class OrderController extends Controller
 {
-    /**
-     * Display a listing of orders for the authenticated user.
-     * GET /api/orders
-     */
-    public function index(Request $request)
-    {
-        // Step 2: Sistem mengecek user — panggil User Service
-        $user = $this->verifyUser($request->bearerToken());
-        if (! $user) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Unauthorized. Token tidak valid.',
-            ], 401);
-        }
-
-        if ($user['email'] === 'admin@example.com') {
-            // Admin bisa melihat semua order
-            $orders = Order::latest()->paginate(10);
-        } else {
-            // User biasa hanya melihat order miliknya
-            $orders = Order::where('user_id', $user['id'])
-                ->latest()
-                ->paginate(10);
-        }
-
-        return response()->json([
-            'success' => true,
-            'data'    => $orders,
-        ]);
-    }
-
-    /**
-     * Store a newly created order.
-     * POST /api/orders
-     *
-     * ALUR SISTEM:
-     * 1. User melakukan order (request masuk)
-     * 2. Sistem mengecek user → panggil User Service (port 8001)
-     * 3. Sistem mengecek produk & stok → panggil Product Service (port 8002)
-     * 4. Order dibuat → simpan di database Order Service
-     * 5. Stok produk berkurang → panggil Product Service reduce-stock
-     *
-     * Expected body:
-     * {
-     *   "product_id": 1,
-     *   "quantity": 2
-     * }
-     */
     public function store(Request $request)
     {
         $request->validate([
-            'product_id' => 'required|integer',
-            'quantity'   => 'required|integer|min:1',
+            // 'user_id' => 'required|integer', // Now handled by Bearer Token
+            'items' => 'required|array',
+            'items.*.product_id' => 'required|integer',
+            'items.*.quantity' => 'required|integer|min:1',
         ]);
 
-        // ── Step 2: Sistem mengecek user ──────────────────────────────
-        $user = $this->verifyUser($request->bearerToken());
-        if (! $user) {
+        // Call Product Service to decrement stock and get real total price
+        try {
+            $response = Http::timeout(15)->post('http://product_service:8000/api/products/decrement', [
+                'items' => $request->items
+            ]);
+
+            if (!$response->successful()) {
+                return response()->json([
+                    'message' => 'Gagal memproses pesanan.',
+                    'error' => $response->json('message') ?? 'Terjadi kesalahan pada Product Service.'
+                ], $response->status());
+            }
+
+            $totalAmount = $response->json('total_amount');
+        } catch (\Exception $e) {
             return response()->json([
-                'success' => false,
-                'message' => 'Unauthorized. Token tidak valid.',
-            ], 401);
+                'message' => 'Product Service tidak dapat dihubungi.',
+                'error' => $e->getMessage()
+            ], 503);
         }
-
-        $productId = $request->product_id;
-        $quantity  = $request->quantity;
-
-        // ── Step 3: Sistem mengecek produk & stok ─────────────────────
-        $productServiceUrl = env('PRODUCT_SERVICE_URL', 'http://127.0.0.1:8002');
-        $checkResponse = Http::post("{$productServiceUrl}/api/products/{$productId}/check-stock", [
-            'quantity' => $quantity,
-        ]);
-
-        if ($checkResponse->failed()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Produk tidak ditemukan.',
-            ], 404);
-        }
-
-        $checkData = $checkResponse->json();
-
-        if (! $checkData['available']) {
-            return response()->json([
-                'success' => false,
-                'message' => "Stok tidak cukup. Tersedia: {$checkData['data']['stock']}",
-            ], 422);
-        }
-
-        $product = $checkData['data'];
-
-        // ── Step 4: Order dibuat ──────────────────────────────────────
-        $totalPrice = $product['price'] * $quantity;
 
         $order = Order::create([
-            'user_id'       => $user['id'],
-            'product_id'    => $product['id'],
-            'product_name'  => $product['name'],
-            'product_price' => $product['price'],
-            'quantity'      => $quantity,
-            'total_price'   => $totalPrice,
-            'status'        => 'pending',
+            'user_id' => $request->attributes->get('user_id'),
+            'total_amount' => $totalAmount,
+            'status' => 'success'
         ]);
 
-        // ── Step 5: Stok produk berkurang (ASINKRON via Redis Queue) ───
-        // Job dikirim ke Redis, diproses oleh Queue Worker di background
-        // User TIDAK perlu menunggu proses ini selesai
-        ReduceProductStockJob::dispatch($productId, $quantity, $order->id);
+        foreach ($request->items as $item) {
+            OrderItem::create([
+                'order_id' => $order->id,
+                'product_id' => $item['product_id'],
+                'quantity' => $item['quantity'],
+                // Because we don't return individual prices from decrement API in this simplified version,
+                // we leave price as 0 or derive it if needed. Let's just set it to 0 for now since total_amount is accurate.
+                'price' => 0 
+            ]);
+        }
 
-        // ── Step 6: Kirim notifikasi order (ASINKRON) ─────────────────
-        SendOrderNotificationJob::dispatch($order->id, $user['name'], $product['name'], $totalPrice);
+        // Publish event to Redis for Notification Service
+        $eventData = json_encode([
+            'user_id' => $order->user_id,
+            'order_id' => $order->id,
+            'message' => "Pesanan #{$order->id} berhasil dibuat dengan total Rp" . number_format($totalAmount, 0, ',', '.')
+        ]);
+
+        Redis::publish('order_created', $eventData);
+
+        $totalQuantity = collect($request->items)->sum('quantity');
 
         return response()->json([
-            'success' => true,
-            'message' => 'Order berhasil dibuat',
-            'data'    => $order,
+            'message' => 'Order created successfully and notification event published',
+            'order' => [
+                'user_id' => $order->user_id,
+                'total_amount' => $order->total_amount,
+                'quantity' => $totalQuantity,
+                'status' => $order->status,
+                'created_at' => $order->created_at,
+                'order_id' => $order->id,
+            ]
         ], 201);
-    }
-
-    /**
-     * Display the specified order.
-     * GET /api/orders/{id}
-     */
-    public function show(Request $request, $id)
-    {
-        $user = $this->verifyUser($request->bearerToken());
-        if (! $user) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Unauthorized.',
-            ], 401);
-        }
-
-        if ($user['email'] === 'admin@example.com') {
-            $order = Order::findOrFail($id);
-        } else {
-            $order = Order::where('user_id', $user['id'])->findOrFail($id);
-        }
-
-        return response()->json([
-            'success' => true,
-            'data'    => $order,
-        ]);
-    }
-
-    /**
-     * Update order status.
-     * PUT /api/orders/{id}/status
-     */
-    public function updateStatus(Request $request, $id)
-    {
-        $request->validate([
-            'status' => 'required|in:pending,processing,shipped,delivered,cancelled',
-        ]);
-
-        $user = $this->verifyUser($request->bearerToken());
-        if (! $user) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Unauthorized.',
-            ], 401);
-        }
-
-        if ($user['email'] !== 'admin@example.com') {
-            return response()->json([
-                'success' => false,
-                'message' => 'Hanya admin yang bisa mengubah status order.',
-            ], 403);
-        }
-
-        $order = Order::findOrFail($id);
-
-        // Jika order sudah cancelled, tidak bisa diubah lagi
-        if ($order->status === 'cancelled') {
-            return response()->json([
-                'success' => false,
-                'message' => 'Order yang sudah dibatalkan tidak bisa diubah statusnya.',
-            ], 422);
-        }
-
-        // If cancelling, restore stock via Redis Queue (ASINKRON)
-        if ($request->status === 'cancelled') {
-            RestoreProductStockJob::dispatch($order->product_id, $order->quantity, $order->id);
-        }
-
-        $order->update(['status' => $request->status]);
-
-        return response()->json([
-            'success' => true,
-            'message' => 'Status order berhasil diupdate',
-            'data'    => $order,
-        ]);
-    }
-
-    /**
-     * Cancel an order (only if pending).
-     * POST /api/orders/{id}/cancel
-     */
-    public function cancel(Request $request, $id)
-    {
-        $user = $this->verifyUser($request->bearerToken());
-        if (! $user) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Unauthorized.',
-            ], 401);
-        }
-
-        $order = Order::where('user_id', $user['id'])->findOrFail($id);
-
-        if ($order->status !== 'pending') {
-            return response()->json([
-                'success' => false,
-                'message' => 'Hanya order dengan status pending yang bisa dibatalkan.',
-            ], 422);
-        }
-
-        // Restore stock via Redis Queue (ASINKRON)
-        // Job dikirim ke Redis, diproses oleh Queue Worker di background
-        RestoreProductStockJob::dispatch($order->product_id, $order->quantity, $order->id);
-
-        $order->update(['status' => 'cancelled']);
-
-        return response()->json([
-            'success' => true,
-            'message' => 'Order berhasil dibatalkan, stok dikembalikan',
-            'data'    => $order,
-        ]);
-    }
-
-    /**
-     * Get orders by User ID.
-     * GET /api/orders/user/{userId}
-     */
-    public function getByUser(Request $request, $userId)
-    {
-        $user = $this->verifyUser($request->bearerToken());
-        if (! $user) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Unauthorized.',
-            ], 401);
-        }
-
-        // Only admin or the user themselves can view their orders
-        if ($user['email'] !== 'admin@example.com' && $user['id'] != $userId) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Forbidden. Anda hanya bisa melihat order Anda sendiri.',
-            ], 403);
-        }
-
-        $orders = Order::where('user_id', $userId)->latest()->get();
-
-        return response()->json([
-            'success' => true,
-            'data'    => $orders,
-        ]);
-    }
-
-    /**
-     * Verify user token via User Service (port 8001).
-     * Returns user data or null if invalid.
-     */
-    private function verifyUser(?string $token): ?array
-    {
-        if (! $token) {
-            return null;
-        }
-
-        $userServiceUrl = env('USER_SERVICE_URL', 'http://127.0.0.1:8001');
-
-        try {
-            $response = Http::withToken($token)
-                ->get("{$userServiceUrl}/api/user/verify");
-
-            if ($response->successful() && $response->json('success')) {
-                return $response->json('data');
-            }
-        } catch (\Exception $e) {
-            // User Service not available
-        }
-
-        return null;
     }
 }

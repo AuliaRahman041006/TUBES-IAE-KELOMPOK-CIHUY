@@ -1,28 +1,15 @@
 <?php
 
-use App\Http\Controllers\ProductController;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\ProductController;
 
-/*
-|--------------------------------------------------------------------------
-| PRODUCT SERVICE — Port 8002
-|--------------------------------------------------------------------------
-|
-| Handles: CRUD Product, Check Stock, Reduce Stock
-| Auth diverifikasi lewat User Service (port 8001)
-|
-*/
+use App\Http\Middleware\VerifyUserServiceToken;
 
-// Public — list & detail products
 Route::get('/products', [ProductController::class, 'index']);
-Route::get('/products/{id}', [ProductController::class, 'show']);
 
-// Protected — manage products (auth dicek via User Service)
-Route::post('/products', [ProductController::class, 'store']);
-Route::put('/products/{id}', [ProductController::class, 'update']);
-Route::delete('/products/{id}', [ProductController::class, 'destroy']);
+Route::middleware([VerifyUserServiceToken::class])->group(function () {
+    Route::post('/products', [ProductController::class, 'store']);
+});
 
-// Internal endpoints — dipanggil oleh Order Service
-Route::post('/products/{id}/check-stock', [ProductController::class, 'checkStock']);
-Route::post('/products/{id}/reduce-stock', [ProductController::class, 'reduceStock']);
-Route::post('/products/{id}/restore-stock', [ProductController::class, 'restoreStock']);
+Route::post('/products/decrement', [ProductController::class, 'decrementStock']);
