@@ -15,5 +15,11 @@ return Application::configure(basePath: dirname(__DIR__))
         $middleware->prepend(\App\Http\Middleware\CorsMiddleware::class);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
-        //
+        $exceptions->shouldRenderJsonWhen(function (\Illuminate\Http\Request $request) {
+            if ($request->is('api/*')) {
+                return true;
+            }
+            return $request->expectsJson();
+        });
     })->create();
+#sashahjsiahjso

@@ -8,6 +8,7 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Http;
 
 /**
  * SendOrderNotificationJob
@@ -35,16 +36,31 @@ class SendOrderNotificationJob implements ShouldQueue
     public function handle(): void
     {
         // Simulasi pengiriman notifikasi (log-based)
-        Log::info("[ASYNC-QUEUE] SendOrderNotificationJob: 📧 Notifikasi Order");
+        Log::info("[ASYNC-QUEUE] SendOrderNotificationJob: 📧 Mempersiapkan Notifikasi Order");
         Log::info("[ASYNC-QUEUE]   Order ID    : #{$this->orderId}");
         Log::info("[ASYNC-QUEUE]   User        : {$this->userName}");
-        Log::info("[ASYNC-QUEUE]   Produk      : {$this->productName}");
-        Log::info("[ASYNC-QUEUE]   Total Harga : Rp " . number_format($this->totalPrice, 0, ',', '.'));
-        Log::info("[ASYNC-QUEUE]   Status      : ✅ Notifikasi terkirim (async)");
 
-        // Di production, bisa diganti dengan:
-        // Mail::to($userEmail)->send(new OrderCreatedMail($this->orderId));
-        // atau HTTP webhook, push notification, dll.
+        $notificationServiceUrl = env('NOTIFICATION_SERVICE_URL', 'http://nginx-notification:80');
+
+        $message = "Order #{$this->orderId} berhasil dibuat untuk {$this->productName} seharga Rp " . number_format($this->totalPrice, 0, ',', '.');
+
+        try {
+            $response = Http::acceptJson()->post("{$notificationServiceUrl}/api/notifications", [
+                'order_id'  => $this->orderId,
+                'recipient' => $this->userName,
+                'type'      => 'order_created',
+                'title'     => 'Order Berhasil Dibuat',
+                'message'   => $message,
+            ]);
+
+            if ($response->successful()) {
+                Log::info("[ASYNC-QUEUE]   Status      : ✅ Notifikasi sukses dicatat di Notification Service");
+            } else {
+                Log::warning("[ASYNC-QUEUE]   Status      : ⚠️ Notification Service merespons dengan error: " . $response->body());
+            }
+        } catch (\Exception $e) {
+            Log::error("[ASYNC-QUEUE]   Status      : 🚨 Gagal menghubungi Notification Service. Error: " . $e->getMessage());
+        }
     }
 
     public function failed(\Throwable $exception): void

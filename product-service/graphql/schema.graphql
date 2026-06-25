@@ -1,0 +1,39 @@
+type Query {
+    "Mengambil semua produk."
+    products: [Product!]! @all
+
+    "Mengambil produk berdasarkan ID."
+    product(id: ID! @eq): Product @find
+}
+
+type Mutation {
+    "Membuat produk baru."
+    createProduct(
+        name: String!
+        price: Float!
+        description: String
+        stock: Int!
+    ): Product! @create
+
+    "Memperbarui produk."
+    updateProduct(
+        id: ID!
+        name: String
+        price: Float
+        description: String
+        stock: Int
+    ): Product @update
+
+    "Menghapus produk."
+    deleteProduct(id: ID! @eq): Product @delete
+}
+
+type Product {
+    id: ID!
+    name: String!
+    price: Float!
+    description: String
+    stock: Int!
+    created_at: DateTime!
+    updated_at: DateTime!
+}

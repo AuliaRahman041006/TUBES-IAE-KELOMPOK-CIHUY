@@ -242,6 +242,36 @@ class OrderController extends Controller
     }
 
     /**
+     * Get orders by User ID.
+     * GET /api/orders/user/{userId}
+     */
+    public function getByUser(Request $request, $userId)
+    {
+        $user = $this->verifyUser($request->bearerToken());
+        if (! $user) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthorized.',
+            ], 401);
+        }
+
+        // Only admin or the user themselves can view their orders
+        if ($user['email'] !== 'admin@example.com' && $user['id'] != $userId) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Forbidden. Anda hanya bisa melihat order Anda sendiri.',
+            ], 403);
+        }
+
+        $orders = Order::where('user_id', $userId)->latest()->get();
+
+        return response()->json([
+            'success' => true,
+            'data'    => $orders,
+        ]);
+    }
+
+    /**
      * Verify user token via User Service (port 8001).
      * Returns user data or null if invalid.
      */
